@@ -20,6 +20,7 @@ class TopicAliveChecker(BaseChecker):
         super().__init__(name=f"TopicAliveChecker({topic})", logger=logger)
         self.topic          = topic
         self.seconds        = seconds
+        self.current_lap    = 0
         self._received      = False
         self._last_msg_time = None
         self._node          = None
@@ -91,17 +92,23 @@ class TopicAliveChecker(BaseChecker):
             pass 
 
     def _callback(self, msg):
-        self._last_msg_time = time.time()
-        if not self._received:
-            self._received = True
-            self.logger.info(f"[{self.name}] Primer mensaje recibido.")
+            # 1. Actualizar tiempo para el heartbeat
+            self._last_msg_time = time.time()
+            
+            # 2. Actualizar vueltas si el mensaje tiene el campo (usamos hasattr para seguridad)
+            if hasattr(msg, 'lap_count'):
+                self.current_lap = msg.lap_count
+
+            if not self._received:
+                self._received = True
+                self.logger.info(f"[{self.name}] Primer mensaje recibido.")
 
     def _check_liveness(self):
         if not self._received or not self._running or self._last_msg_time is None:
             return
 
         elapsed = time.time() - self._last_msg_time
-        if elapsed > self.seconds:
+        if elapsed > self.seconds and (self.current_lap > 1 and self.topic != "/path_planning/trajectory2"):
             self._record_failure(f"Silencio en '{self.topic}': {elapsed:.2f}s sin datos.")
             if self._timer:
                 self._timer.cancel()

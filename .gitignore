@@ -1,0 +1,4 @@
+failures/
+test_bags/
+logs/
+checkers/__pycache__/
