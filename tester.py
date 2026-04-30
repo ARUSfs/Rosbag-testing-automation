@@ -228,14 +228,45 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
         return all_failures
 
     def stop_process(proc, name: str):
-        """Para un proceso con SIGINT y espera, kill si no responde."""
-        if proc and proc.poll() is None:
-            logger.debug(f"  Terminating {name} process (PID {proc.pid})")
-            proc.send_signal(signal.SIGINT)
+        """Detiene un proceso y su grupo sin matar al padre."""
+        if proc is None:
+            return
+
+        # Comprobar si el proceso ya terminó
+        if proc.poll() is not None:
+            logger.debug(f"  [STOP] {name} ya había terminado.")
+            return
+
+        try:
+            # Obtener el ID del grupo de procesos del hijo
+            pgid = os.getpgid(proc.pid)
+            
+            # SEGURIDAD CRÍTICA: Nunca matar el grupo de procesos del script actual
+            if pgid == os.getpgrp():
+                logger.warning(f"  [STOP] ERROR DE SEGURIDAD: El grupo de {name} es igual al del padre. Abortando killpg.")
+                proc.terminate() # Fallback seguro: matar solo este proceso
+                return
+
+            logger.info(f"  [STOP] Enviando SIGINT al grupo {pgid} ({name})...")
+            os.killpg(pgid, signal.SIGINT)
+            
+            # Esperar a que los procesos cierren
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                # Esperamos 5 segundos a que el grupo muera
+                for _ in range(50): 
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+            except Exception:
+                pass
+
+            # Si sigue vivo, forzamos la salida del grupo
+            if proc.poll() is None:
+                logger.warning(f"  [STOP] {name} persistente, forzando killpg...")
+                os.killpg(pgid, signal.SIGKILL)
+                
+        except OSError as e:
+            logger.error(f"  [STOP] Error procesando {name}: {e}")
 
     # Extensiones de bag que ROS2 puede generar
     BAG_EXTENSIONS = {".mcap", ".db3"}
@@ -287,6 +318,7 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
             launch_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True
         )
         logger.debug(f"  Launch PID : {proc_launch.pid}")
 
