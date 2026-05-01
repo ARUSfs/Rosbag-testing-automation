@@ -34,12 +34,10 @@ def setup_logging(log_dir: Path) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
 
-    # File handler
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -53,7 +51,6 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 #  Config loader
 # ──────────────────────────────────────────────
 def load_config(config_path: str) -> dict:
-    """Load and validate the YAML configuration file."""
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -70,10 +67,108 @@ def load_config(config_path: str) -> dict:
 
 
 # ──────────────────────────────────────────────
+#  BUILD — compilación automática del monitor C++
+# ──────────────────────────────────────────────
+def build_cpp_monitor(config: dict, logger: logging.Logger) -> str:
+    """
+    Ejecuta build_monitor.sh para compilar el paquete ros2_monitor.
+
+    Parsea la línea "SETUP_BASH=..." de stdout para obtener la ruta
+    al setup.bash del workspace, que se inyecta en el entorno del proceso.
+
+    Retorna la ruta al setup.bash del workspace instalado.
+    Lanza RuntimeError si la compilación falla.
+    """
+    build_cfg   = config.get("build", {})
+    workspace   = build_cfg.get("ros2_workspace", str(Path.home() / "ros2_ws"))
+    script_dir  = Path(__file__).parent.resolve()
+    build_script = script_dir / "build_monitor.sh"
+
+    if not build_script.exists():
+        raise FileNotFoundError(
+            f"Script de compilación no encontrado: {build_script}\n"
+            "Asegúrate de que build_monitor.sh está junto a main_tester.py"
+        )
+
+    logger.info("=" * 60)
+    logger.info("  BUILD — compilando ros2_monitor (C++)")
+    logger.info(f"  Workspace : {workspace}")
+    logger.info(f"  Script    : {build_script}")
+    logger.info("=" * 60)
+
+    # ── Diagnóstico previo del entorno ───────────────────────────────────────
+    _pre_checks = {
+        "ROS2 Humble setup.bash": Path("/opt/ros/humble/setup.bash"),
+        "workspace src/":         Path(workspace) / "src",
+        "colcon en PATH":         Path(shutil.which("colcon") or ""),
+    }
+    for label, p in _pre_checks.items():
+        estado = "OK" if p.exists() else "NO ENCONTRADO"
+        level  = logger.info if p.exists() else logger.error
+        level(f"  [{estado}] {label}: {p}")
+
+    result = subprocess.run(
+        ["bash", str(build_script), workspace],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # stderr fusionado con stdout → un solo stream
+    )
+
+    # Volcar toda la salida del script al logger, línea a línea,
+    # y buscar la línea especial SETUP_BASH=...
+    setup_bash_path = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("SETUP_BASH="):
+            setup_bash_path = stripped.split("=", 1)[1].strip()
+        else:
+            # Usar ERROR si el script ya terminó con código != 0
+            log_fn = logger.error if result.returncode != 0 else logger.info
+            log_fn(f"[build] {stripped}")
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"build_monitor.sh falló con código {result.returncode}."
+        )
+
+    if not setup_bash_path or not Path(setup_bash_path).exists():
+        raise RuntimeError(
+            f"build_monitor.sh no emitió una ruta SETUP_BASH válida "
+            f"(recibido: {setup_bash_path!r})"
+        )
+
+    logger.info(f"  setup.bash → {setup_bash_path}")
+    logger.info("  BUILD completado con éxito")
+    logger.info("=" * 60)
+
+    return setup_bash_path
+
+
+def _patch_env_with_setup(setup_bash: str) -> dict:
+    """
+    Ejecuta `source <setup_bash> && env` en un subshell para obtener
+    el entorno ROS2 completo y devuelve un dict con las variables.
+
+    Se usa para que los subprocesos de ros2 run/launch/bag encuentren
+    el paquete ros2_monitor recién compilado.
+    """
+    cmd = f"bash -c 'source {setup_bash} && env'"
+    raw = subprocess.check_output(cmd, shell=True, text=True)
+
+    env = {}
+    for line in raw.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+# ──────────────────────────────────────────────
 #  Directory structure check
 # ──────────────────────────────────────────────
 def ensure_directories(config: dict, logger: logging.Logger) -> dict:
-    """Ensure all required directories exist, create them if missing."""
     dirs = {}
     for name, path_str in config["directories"].items():
         p = Path(path_str).expanduser().resolve()
@@ -89,23 +184,14 @@ def ensure_directories(config: dict, logger: logging.Logger) -> dict:
 #  Rosbag discovery
 # ──────────────────────────────────────────────
 def get_rosbags(test_bags_dir: Path) -> list[Path]:
-    """Return a sorted list of .mcap files in the test_bags directory."""
-    bags = sorted(test_bags_dir.glob("*.mcap"))
-    return bags
+    return sorted(test_bags_dir.glob("*.mcap"))
 
 
 # ──────────────────────────────────────────────
 #  Report writer
 # ──────────────────────────────────────────────
 def write_report(bag_path: Path, reports_dir: Path, failures: list, logger: logging.Logger):
-    """
-    Escribe el reporte de fallos en reports/.
-    Nombre: report_<bag>_<fecha>_<hora>_at_<primer_elapsed>s.txt
-    failures: lista de dicts {"reason": str, "elapsed": float} o lista de strings
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Safely extract the elapsed time of the first failure
+    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     first_elapsed = 0
     if failures:
         if isinstance(failures[0], dict) and "elapsed" in failures[0]:
@@ -123,61 +209,36 @@ def write_report(bag_path: Path, reports_dir: Path, failures: list, logger: logg
         f"Failures   : {len(failures)}",
         "-" * 60,
     ]
-    
+
     for i, f in enumerate(failures, 1):
-        # Handle both dictionary and string formats safely
         if isinstance(f, dict):
             elapsed_str = f"{f.get('elapsed', 0.0):.1f}s"
-            reason = f.get("reason", "Unknown error")
+            reason      = f.get("reason", "Unknown error")
         else:
             elapsed_str = "??.?s"
-            reason = str(f)
-            
+            reason      = str(f)
         lines.append(f"  [{i}] @ {elapsed_str} — {reason}")
-        
-    lines.append("=" * 60)
 
+    lines.append("=" * 60)
     report_path.write_text("\n".join(lines) + "\n")
     logger.info(f"Report written → {report_path}")
     return report_path
 
 
 # ──────────────────────────────────────────────
-#  Move bag to failures
-# ──────────────────────────────────────────────
-def move_to_failures(bag_path: Path, failures_dir: Path, logger: logging.Logger):
-    dest = failures_dir / bag_path.name
-    # Avoid overwriting if a bag with the same name already failed before
-    if dest.exists():
-        stem = bag_path.stem
-        suffix = bag_path.suffix
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = failures_dir / f"{stem}_{timestamp}{suffix}"
-
-    shutil.move(str(bag_path), str(dest))
-    logger.warning(f"Bag moved to failures → {dest}")
-
-
-# ──────────────────────────────────────────────
 #  Single bag simulation
 # ──────────────────────────────────────────────
-def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) -> tuple[bool, list[dict]]:
+def run_bag(
+    bag_path: Path,
+    config: dict,
+    dirs: dict,
+    ros_env: dict,
+    logger: logging.Logger,
+) -> tuple[bool, list[dict]]:
     """
-    Ejecuta el testeo de un rosbag:
-      1. ros2 launch  — arranca la simulación
-      2. ros2 bag play — reproduce el bag
-      3. ros2 bag record — graba la sesión en un directorio temporal
-      4. checkers — monitorizan en paralelo
-
-    Al terminar, los ficheros del recording se distribuyen SIEMPRE:
-      .mcap         → recordings/
-      metadata.yaml → metadata/
-
-    El bag original solo se mueve si hay fallos (lo gestiona main_loop):
-      original .mcap → failures/
-
-    Returns (True, []) si no hay fallos,
-            (False, [lista de fallos]) si algún checker detecta algo.
+    Ejecuta el testeo de un rosbag.
+    `ros_env` es el entorno ROS2 completo (con el workspace compilado sourced)
+    que se inyecta en todos los subprocesos.
     """
     launch_cfg   = config["rosbag_launch"]
     play_cfg     = config["rosbag_play"]
@@ -195,22 +256,19 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
         str(bag_path),
     ] + play_cfg.get("extra_args", [])
 
-    # Directorio temporal para la grabación
-    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    record_dir  = Path(f"/tmp/rosbag_record_{bag_path.stem}_{timestamp}")
-    # --storage mcap fuerza formato .mcap (el defecto de ROS2 es .db3)
-    record_cmd  = [
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    record_dir = Path(f"/tmp/rosbag_record_{bag_path.stem}_{timestamp}")
+    record_cmd = [
         "ros2", "bag", "record",
         "-o", str(record_dir),
         "--storage", "mcap",
-        "-a",                      # graba todos los topics
+        "-a",
     ]
 
     logger.info(f"  Launch cmd : {' '.join(launch_cmd)}")
     logger.info(f"  Play cmd   : {' '.join(play_cmd)}")
     logger.info(f"  Record cmd : {' '.join(record_cmd)}")
 
-    # ── Instanciar checkers ────────────────────────────────────
     checkers = build_checkers(checker_cfgs, logger)
     logger.info(f"  Checkers   : {[c.name for c in checkers] or 'none'}")
 
@@ -221,14 +279,12 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
     def collect_failures() -> list[dict]:
         all_failures = []
         for checker in checkers:
-            # Comprobar de forma segura si el método stop existe
             if hasattr(checker, "stop"):
                 checker.stop()
             all_failures.extend(checker.failures())
         return all_failures
 
     def stop_process(proc, name: str):
-        """Para un proceso con SIGINT y espera, kill si no responde."""
         if proc and proc.poll() is None:
             logger.debug(f"  Terminating {name} process (PID {proc.pid})")
             proc.send_signal(signal.SIGINT)
@@ -237,29 +293,20 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-    # Extensiones de bag que ROS2 puede generar
     BAG_EXTENSIONS = {".mcap", ".db3"}
 
     def handle_recording():
-        """
-        Tras el testeo, los ficheros del recording se distribuyen SIEMPRE:
-          fichero de bag (.mcap / .db3) → recordings/
-          metadata.yaml                 → metadata/
-
-        El resultado (PASS/FAIL) no afecta aquí; solo condiciona si el bag
-        original se mueve a failures/ (eso lo decide main_loop).
-        """
         if not record_dir.exists():
             logger.warning("  Recording dir no encontrado — no se grabó nada.")
             return
 
         _recordings_dir = dirs["recordings"]
         _metadata_dir   = dirs["metadata"]
-
-        # Log de diagnóstico: qué hay realmente en el directorio
-        contents = list(record_dir.iterdir())
-        logger.debug(f"  Record dir contents ({len(contents)} items): "
-                     f"{[f.name for f in contents]}")
+        contents        = list(record_dir.iterdir())
+        logger.debug(
+            f"  Record dir contents ({len(contents)} items): "
+            f"{[f.name for f in contents]}"
+        )
 
         moved = 0
         for f in contents:
@@ -277,50 +324,48 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
                 logger.debug(f"  Ignorado: {f.name}")
 
         if moved == 0:
-            logger.warning("  Recording dir existe pero no contiene ficheros de bag reconocidos.")
+            logger.warning(
+                "  Recording dir existe pero no contiene ficheros reconocidos.")
 
         shutil.rmtree(str(record_dir), ignore_errors=True)
 
     try:
-        # ── 1. Arrancar simulación ─────────────────────────────
         proc_launch = subprocess.Popen(
             launch_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=ros_env,        # ← entorno ROS2 con workspace sourced
         )
         logger.debug(f"  Launch PID : {proc_launch.pid}")
-
         time.sleep(test_cfg.get("launch_settle_seconds", 2.0))
 
-        # ── 2. Arrancar reproducción ───────────────────────────
         proc_play = subprocess.Popen(
             play_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=ros_env,
         )
         logger.debug(f"  Play PID   : {proc_play.pid}")
 
-        # ── 3. Arrancar grabación ──────────────────────────────
         proc_record = subprocess.Popen(
             record_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=ros_env,
         )
         logger.debug(f"  Record PID : {proc_record.pid}")
 
-        # ── 4. Arrancar checkers ───────────────────────────────
         for checker in checkers:
             checker.start()
 
-        # ── 5. Monitorizar checkers y reproducción ────────────
-        timeout = test_cfg.get("play_timeout_seconds", None)
+        timeout       = test_cfg.get("play_timeout_seconds", None)
         poll_interval = 0.2
-        elapsed = 0.0
-        failures = []
+        elapsed       = 0.0
+        failures      = []
+
         while True:
             if proc_play.poll() is not None:
                 break
-            # Consultar fallos de los checkers en cada ciclo
             failures = []
             for checker in checkers:
                 failures.extend(checker.failures())
@@ -333,19 +378,14 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
                 logger.error("  Playback exceeded timeout — treating as failure.")
                 break
 
-        # Parar procesos si no han terminado
         stop_process(proc_record, "record")
         stop_process(proc_play,   "play")
         stop_process(proc_launch, "launch")
         time.sleep(test_cfg.get("record_settle_seconds", 1.0))
 
-        # Recoger fallos definitivos
         failures = collect_failures()
-        success  = len(failures) == 0
-
-        # ── 8. Distribuir recording (siempre) ─────────────────
         handle_recording()
-        return (success, failures)
+        return (len(failures) == 0, failures)
 
     except subprocess.TimeoutExpired:
         logger.error("  Playback exceeded timeout — treating as failure.")
@@ -367,8 +407,6 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
         stop_process(proc_record, "record")
         stop_process(proc_play,   "play")
         stop_process(proc_launch, "launch")
-        
-        # NUEVO: Detener explícitamente los checkers si el usuario hace Ctrl+C
         for checker in checkers:
             if hasattr(checker, "stop"):
                 checker.stop()
@@ -377,15 +415,11 @@ def run_bag(bag_path: Path, config: dict, dirs: dict, logger: logging.Logger) ->
 # ──────────────────────────────────────────────
 #  Main loop
 # ──────────────────────────────────────────────
-def main_loop(config: dict, dirs: dict, logger: logging.Logger):
-
-    test_bags_dir  = dirs["test_bags"]
-    failures_dir   = dirs["failures"]
-    reports_dir    = dirs["reports"]
-    cycle          = 0
-
-    # Permitir configurar el número de iteraciones por rosbag
-    iteraciones_por_bag = config["testing"].get("iteraciones_por_bag", 1)
+def main_loop(config: dict, dirs: dict, ros_env: dict, logger: logging.Logger):
+    test_bags_dir        = dirs["test_bags"]
+    reports_dir          = dirs["reports"]
+    cycle                = 0
+    iteraciones_por_bag  = config["testing"].get("iteraciones_por_bag", 1)
 
     logger.info("=" * 60)
     logger.info("  ROSBAG AUTOMATION TESTING — starting infinite loop")
@@ -398,36 +432,44 @@ def main_loop(config: dict, dirs: dict, logger: logging.Logger):
             bags = get_rosbags(test_bags_dir)
 
             if not bags:
-                logger.info(f"[Cycle {cycle}] No .mcap files found in {test_bags_dir}. Waiting...")
+                logger.info(
+                    f"[Cycle {cycle}] No .mcap files found in {test_bags_dir}. Waiting..."
+                )
                 time.sleep(config["testing"].get("empty_dir_wait_seconds", 10))
                 continue
 
             logger.info(f"[Cycle {cycle}] Found {len(bags)} bag(s) to process.")
 
-
             for bag_path in bags:
-                algun_fallo = False
-                todas_las_fallos = []
-                for iteracion in range(1, iteraciones_por_bag + 1):
-                    logger.info(f"  ▶ Processing: {bag_path.name} (Iteración {iteracion}/{iteraciones_por_bag})")
-                    success, failures = run_bag(bag_path, config, dirs, logger)
-                    if success:
-                        logger.info(f"  ✔ PASSED — {bag_path.name} (Iteración {iteracion})")
-                    else:
-                        logger.warning(f"  ✖ FAILED  — {bag_path.name} (Iteración {iteracion})")
-                        algun_fallo = True
-                        # Guardar los fallos de todas las iteraciones
-                        todas_las_fallos.extend(failures)
+                algun_fallo    = False
+                todas_los_fallos = []
 
-                # Al terminar todas las iteraciones:
+                for iteracion in range(1, iteraciones_por_bag + 1):
+                    logger.info(
+                        f"  ▶ Processing: {bag_path.name} "
+                        f"(Iteración {iteracion}/{iteraciones_por_bag})"
+                    )
+                    success, failures = run_bag(
+                        bag_path, config, dirs, ros_env, logger
+                    )
+                    if success:
+                        logger.info(
+                            f"  ✔ PASSED — {bag_path.name} (Iteración {iteracion})"
+                        )
+                    else:
+                        logger.warning(
+                            f"  ✖ FAILED  — {bag_path.name} (Iteración {iteracion})"
+                        )
+                        algun_fallo = True
+                        todas_los_fallos.extend(failures)
+
                 if algun_fallo:
                     write_report(
                         bag_path=bag_path,
                         reports_dir=reports_dir,
-                        failures=todas_las_fallos,
+                        failures=todas_los_fallos,
                         logger=logger,
                     )
-                    move_to_failures(bag_path, failures_dir, logger)
 
             logger.info(f"[Cycle {cycle}] All bags processed. Restarting cycle...\n")
 
@@ -449,17 +491,31 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 1. Load config
+    # 1. Cargar config
     try:
         cfg = load_config(args.config)
     except (FileNotFoundError, KeyError) as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
 
-    # 2. Ensure directories
+    # 2. Directorios y logger
     log_dir = Path(cfg["directories"].get("logs", "logs"))
     logger  = setup_logging(log_dir)
     dirs    = ensure_directories(cfg, logger)
 
-    # 3. Run
-    main_loop(cfg, dirs, logger)
+    # 3. Compilar el monitor C++ — ANTES de cualquier otra cosa
+    try:
+        setup_bash = build_cpp_monitor(cfg, logger)
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.error(f"Error en la compilación del monitor C++: {e}")
+        sys.exit(1)
+
+    # 4. Construir el entorno ROS2 completo (workspace sourced)
+    try:
+        ros_env = _patch_env_with_setup(setup_bash)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"No se pudo hacer source de {setup_bash}: {e}")
+        sys.exit(1)
+
+    # 5. Arrancar el loop principal
+    main_loop(cfg, dirs, ros_env, logger)
