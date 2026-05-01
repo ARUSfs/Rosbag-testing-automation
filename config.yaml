@@ -2,6 +2,9 @@
 #  ROSBAG AUTOMATION TESTING — Configuration File
 # ──────────────────────────────────────────────────────────────
 
+build:
+  ros2_workspace: "/root/ws"
+
 # Directory layout
 directories:
   test_bags  : "test_bags"              # Rosbags pendientes de testear
